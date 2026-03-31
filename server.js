@@ -171,6 +171,26 @@ async function listPRs() {
   });
 }
 
+// API: list recently merged PRs
+async function listMergedPRs() {
+  var prs = await gh("/pulls?state=closed&sort=updated&direction=desc&per_page=30");
+  var merged = prs.filter(function(pr) { return pr.merged_at; }).slice(0, 10);
+  return merged.map(function(pr) {
+    return {
+      number: pr.number,
+      title: pr.title,
+      body: pr.body || "",
+      author: pr.user.login,
+      avatar: pr.user.avatar_url,
+      branch: pr.head.ref,
+      base: pr.base.ref,
+      merged_at: pr.merged_at,
+      html_url: pr.html_url,
+      merged: true
+    };
+  });
+}
+
 // Review cache
 var REVIEWS_DIR = path.join(__dirname, "reviews");
 if (!fs.existsSync(REVIEWS_DIR)) fs.mkdirSync(REVIEWS_DIR);
@@ -349,6 +369,9 @@ function getHTML() {
   .expand-btn { background: none; border: none; color: #475569; cursor: pointer; font-size: 14px; padding: 2px 6px; line-height: 1; }
   .expand-btn:hover { color: #818cf8; }
 
+  .merged-badge { font-size: 11px; padding: 4px 12px; border-radius: 99px; font-weight: 600; background: rgba(168,85,247,.15); color: #c084fc; }
+  .merged-card .btn-cherry { display: inline-block; }
+
   .error-msg { color: #f87171; font-size: 12px; padding: 8px 0; }
   .no-prs { text-align: center; padding: 60px; color: #475569; }
 </style>
@@ -358,12 +381,14 @@ function getHTML() {
   <h1>PR Review Dashboard</h1>
   <div class="subtitle" id="subtitle">Loading...</div>
   <div id="content"><div class="loading"><span class="spinner"></span> Fetching PRs from the last 2 weeks...</div></div>
+  <h2 id="merged-heading" style="font-size:18px;margin-top:32px;margin-bottom:12px;display:none">Recently Merged</h2>
+  <div id="merged-content"></div>
 </div>
 <script>
 var REPO = ${JSON.stringify(REPO)};
 var targetBranch = ${JSON.stringify(CHERRY_PICK_TARGET)};
 
-document.addEventListener('DOMContentLoaded', loadPRs);
+document.addEventListener('DOMContentLoaded', function() { loadPRs(); loadMergedPRs(); });
 
 async function loadPRs() {
   try {
@@ -375,6 +400,17 @@ async function loadPRs() {
   } catch(e) {
     document.getElementById('content').innerHTML = '<div class="error-msg">Error: ' + esc(e.message) + '</div>';
   }
+}
+
+async function loadMergedPRs() {
+  try {
+    var res = await fetch('/api/merged-prs');
+    if (!res.ok) return;
+    var prs = await res.json();
+    if (!prs.length) return;
+    document.getElementById('merged-heading').style.display = '';
+    renderMergedPRs(prs);
+  } catch(e) { /* ignore */ }
 }
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
@@ -448,6 +484,38 @@ function renderPRs(prs) {
     loadFiles(pr.number);
     loadCachedReview(pr.number);
   });
+}
+
+function renderMergedPRs(prs) {
+  var html = '';
+  prs.forEach(function(pr) {
+    var merged = new Date(pr.merged_at).toLocaleDateString();
+    var tickets = extractJiraTickets(pr);
+    var ticketHtml = tickets.map(function(t) {
+      return '<a class="jira-badge" href="' + JIRA_BASE + t + '" target="_blank">' + t + '</a>';
+    }).join('');
+
+    html += '<div class="pr-card merged-card" id="pr-' + pr.number + '">'
+      + '<div class="pr-header">'
+      + '<img class="pr-avatar" src="' + esc(pr.avatar) + '" alt="">'
+      + '<div class="pr-info">'
+      + '<div class="pr-title-row">'
+      + '<span class="pr-number">#' + pr.number + '</span>'
+      + '<span class="pr-title">' + esc(pr.title) + '</span>'
+      + ticketHtml
+      + '</div>'
+      + '<div class="pr-meta">' + esc(pr.author) + ' | ' + esc(pr.branch) + ' &rarr; ' + esc(pr.base) + ' | merged ' + merged + '</div>'
+      + '</div>'
+      + '<div class="pr-actions">'
+      + '<span class="merged-badge">Merged</span>'
+      + '<a class="btn-github" href="' + esc(pr.html_url) + '" target="_blank">GitHub</a>'
+      + '<button class="btn-cherry" id="btn-cherry-' + pr.number + '" onclick="cherryPick(' + pr.number + ')">Cherry-pick to ' + esc(targetBranch) + '</button>'
+      + '</div>'
+      + '</div>'
+      + '<div id="cherry-result-' + pr.number + '"></div>'
+      + '</div>';
+  });
+  document.getElementById('merged-content').innerHTML = html;
 }
 
 async function loadCachedReview(num) {
@@ -686,6 +754,10 @@ var server = http.createServer(async function(req, res) {
       res.end(getHTML());
     } else if (req.method === "GET" && req.url === "/api/prs") {
       var prs = await listPRs();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(prs));
+    } else if (req.method === "GET" && req.url === "/api/merged-prs") {
+      var prs = await listMergedPRs();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(prs));
     } else if (req.method === "GET" && req.url.startsWith("/api/files/")) {
