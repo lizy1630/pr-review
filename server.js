@@ -17,12 +17,10 @@ try {
 var TOKEN = process.env.GITHUB_TOKEN;
 var REPO = process.env.GITHUB_REPO || "InspireHUB/IHUB_Platform";
 var AI_KEY = process.env.ANTHROPIC_API_KEY;
-var GEMINI_KEY = process.env.GEMINI_API_KEY;
-var OPENAI_KEY = process.env.OPENAI_API_KEY;
 var PORT = process.env.PORT || 3000;
 var CHERRY_PICK_TARGET = process.env.CHERRY_PICK_TARGET || "release/v5.9.3";
 
-if (!TOKEN) { console.error("Missing GITHUB_TOKEN in .env"); process.exit(1); }
+if (!TOKEN || !AI_KEY) { console.error("Missing GITHUB_TOKEN or ANTHROPIC_API_KEY in .env"); process.exit(1); }
 
 var SKIP_EXT = [".json", ".lock", ".snap", ".map", ".min.js", ".min.css"];
 var SKIP_PATTERN = [".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.tsx", ".test.jsx", ".stories.tsx", ".stories.ts"];
@@ -242,9 +240,20 @@ function buildPrompt(pr, diff) {
   return REVIEW_PROMPT + "PR: " + pr.title + " (#" + pr.number + ")\nBranch: " + pr.head.ref + " -> " + pr.base.ref + "\nAuthor: " + pr.user.login + "\n\nDIFF:\n" + diff;
 }
 
-// Provider: Claude
-async function callClaude(prompt) {
-  if (!AI_KEY) throw new Error("ANTHROPIC_API_KEY not set in .env");
+// API: review a single PR with Claude
+async function reviewPR(prNum) {
+  var prs = await gh("/pulls?state=open&per_page=100");
+  var pr = prs.find(function(p) { return p.number === prNum; });
+  if (!pr) throw new Error("PR #" + prNum + " not found");
+
+  var rawDiff = await gh("/pulls/" + prNum, "application/vnd.github.v3.diff");
+  var diff = filterDiff(rawDiff);
+
+  if (diff.trim().length < 10) {
+    return { summary: "No reviewable code changes after filtering.", issues: [], risk_score: 0 };
+  }
+
+  var prompt = buildPrompt(pr, diff);
   var r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": AI_KEY, "anthropic-version": "2023-06-01" },
@@ -255,64 +264,8 @@ async function callClaude(prompt) {
   });
   if (!r.ok) { var t = await r.text(); throw new Error("Claude API " + r.status + ": " + t); }
   var d = await r.json();
-  return d.content.map(function(c) { return c.text || ""; }).join("");
-}
-
-// Provider: Gemini
-async function callGemini(prompt) {
-  if (!GEMINI_KEY) throw new Error("GEMINI_API_KEY not set in .env");
-  var r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_KEY, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 4000 }
-    })
-  });
-  if (!r.ok) { var t = await r.text(); throw new Error("Gemini API " + r.status + ": " + t); }
-  var d = await r.json();
-  return d.candidates[0].content.parts.map(function(p) { return p.text || ""; }).join("");
-}
-
-// Provider: GPT
-async function callGPT(prompt) {
-  if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY not set in .env");
-  var r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + OPENAI_KEY },
-    body: JSON.stringify({
-      model: "gpt-4o", max_tokens: 4000,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
-  if (!r.ok) { var t = await r.text(); throw new Error("GPT API " + r.status + ": " + t); }
-  var d = await r.json();
-  return d.choices[0].message.content;
-}
-
-var PROVIDERS = { claude: callClaude, gemini: callGemini, gpt: callGPT };
-
-// API: review a single PR with a chosen provider
-async function reviewPR(prNum, provider) {
-  provider = provider || "claude";
-  var callFn = PROVIDERS[provider];
-  if (!callFn) throw new Error("Unknown provider: " + provider);
-
-  var prs = await gh("/pulls?state=open&per_page=100");
-  var pr = prs.find(function(p) { return p.number === prNum; });
-  if (!pr) throw new Error("PR #" + prNum + " not found");
-
-  var rawDiff = await gh("/pulls/" + prNum, "application/vnd.github.v3.diff");
-  var diff = filterDiff(rawDiff);
-
-  if (diff.trim().length < 10) {
-    return { provider: provider, summary: "No reviewable code changes after filtering.", issues: [], risk_score: 0 };
-  }
-
-  var prompt = buildPrompt(pr, diff);
-  var txt = await callFn(prompt);
+  var txt = d.content.map(function(c) { return c.text || ""; }).join("");
   var parsed = JSON.parse(txt.replace(/```json|```/g, "").trim());
-  parsed.provider = provider;
   var cached = saveCachedReview(prNum, parsed);
   parsed.reviewed_at = cached.reviewed_at;
   return parsed;
@@ -359,16 +312,11 @@ function getHTML() {
   .file-toggle:hover { text-decoration: underline; }
 
   .pr-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
-  .btn-review { color: #fff; border: none; padding: 8px 14px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: background .2s; }
+  .btn-review { background: #818cf8; color: #fff; border: none; padding: 8px 20px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .2s; }
+  .btn-review:hover { background: #6366f1; }
   .btn-review:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
-  .btn-review.reviewing { background: #334155; color: #64748b; }
-  .btn-review.claude { background: #d97706; }
-  .btn-review.claude:hover:not(:disabled) { background: #b45309; }
-  .btn-review.gemini { background: #2563eb; }
-  .btn-review.gemini:hover:not(:disabled) { background: #1d4ed8; }
-  .btn-review.gpt { background: #16a34a; }
-  .btn-review.gpt:hover:not(:disabled) { background: #15803d; }
-  .pr-card.collapsed .btn-review { padding: 4px 8px; font-size: 10px; }
+  .btn-review.reviewing { background: #334155; }
+  .pr-card.collapsed .btn-review { padding: 4px 10px; font-size: 11px; }
   .btn-github { background: #1e1e2e; color: #e2e8f0; border: 1px solid #334155; padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; transition: background .2s; display: inline-flex; align-items: center; gap: 5px; }
   .btn-github:hover { background: #2d2d44; }
   .jira-badge { display: inline-block; font-size: 11px; padding: 3px 10px; border-radius: 99px; font-weight: 600; background: rgba(129,140,248,.12); color: #818cf8; text-decoration: none; margin-left: 6px; }
@@ -527,9 +475,7 @@ function renderPRs(prs) {
       + '<div class="pr-actions">'
       + '<button class="expand-btn" id="expand-btn-' + pr.number + '" onclick="toggleCollapse(' + pr.number + ')" style="display:none" title="Expand/Collapse">&#9660;</button>'
       + '<a class="btn-github" href="' + esc(pr.html_url) + '" target="_blank">GitHub</a>'
-      + '<button class="btn-review claude" id="btn-claude-' + pr.number + '" onclick="reviewPR(' + pr.number + ',\\'claude\\')">Claude</button>'
-      + '<button class="btn-review gemini" id="btn-gemini-' + pr.number + '" onclick="reviewPR(' + pr.number + ',\\'gemini\\')">Gemini</button>'
-      + '<button class="btn-review gpt" id="btn-gpt-' + pr.number + '" onclick="reviewPR(' + pr.number + ',\\'gpt\\')">GPT</button>'
+      + '<button class="btn-review" id="btn-' + pr.number + '" onclick="reviewPR(' + pr.number + ')">Review with AI</button>'
       + '<button class="btn-cherry" id="btn-cherry-' + pr.number + '" onclick="cherryPick(' + pr.number + ')" style="display:none">Cherry-pick to ' + esc(targetBranch) + '</button>'
       + '</div>'
       + '</div>'
@@ -690,38 +636,33 @@ function toggleFiles(id, btn) {
   else { el.style.display = 'none'; btn.textContent = 'Show files'; }
 }
 
-var providerNames = { claude: 'Claude', gemini: 'Gemini', gpt: 'GPT' };
-
-async function reviewPR(num, provider) {
-  provider = provider || 'claude';
-  var btn = document.getElementById('btn-' + provider + '-' + num);
+async function reviewPR(num) {
+  var btn = document.getElementById('btn-' + num);
   var resultDiv = document.getElementById('result-' + num);
-  // Disable all 3 buttons while reviewing
-  ['claude','gemini','gpt'].forEach(function(p) {
-    var b = document.getElementById('btn-' + p + '-' + num);
-    if (b) { b.disabled = true; b.classList.add('reviewing'); }
-  });
+  btn.disabled = true;
+  btn.classList.add('reviewing');
   btn.textContent = 'Reviewing...';
-  resultDiv.innerHTML = '<div class="review-summary"><span class="spinner"></span> Sending to ' + providerNames[provider] + ' for review...</div>';
+  resultDiv.innerHTML = '<div class="review-summary"><span class="spinner"></span> Fetching diff and sending to Claude for review...</div>';
 
   try {
-    var res = await fetch('/api/review/' + num + '?provider=' + provider);
+    var res = await fetch('/api/review/' + num);
     if (!res.ok) {
       var errText = await res.text();
       throw new Error(errText || 'Review failed');
     }
     var data = await res.json();
+    resultDiv.innerHTML = '';
     await renderReview(num, data);
     setAIChecked(num, true);
     checkCollapse(num);
+    btn.textContent = 'Re-review';
+    btn.disabled = false;
+    btn.classList.remove('reviewing');
   } catch(e) {
-    resultDiv.innerHTML = '<div class="error-msg">' + providerNames[provider] + ' review failed: ' + esc(e.message) + '</div>';
-  } finally {
-    // Re-enable all buttons
-    ['claude','gemini','gpt'].forEach(function(p) {
-      var b = document.getElementById('btn-' + p + '-' + num);
-      if (b) { b.disabled = false; b.classList.remove('reviewing'); b.textContent = providerNames[p]; }
-    });
+    resultDiv.innerHTML = '<div class="error-msg">Review failed: ' + esc(e.message) + '</div>';
+    btn.disabled = false;
+    btn.classList.remove('reviewing');
+    btn.textContent = 'Retry Review';
   }
 }
 
@@ -729,12 +670,7 @@ var reviewCounter = 0;
 
 async function renderReview(num, data) {
   var resultDiv = document.getElementById('result-' + num);
-  var provider = data.provider || 'ai';
-  var blockId = 'review-block-' + num + '-' + provider + '-' + (++reviewCounter);
-
-  // Remove previous block from same provider if exists
-  var prev = document.getElementById('review-block-' + num + '-' + provider);
-  if (prev) prev.remove();
+  var blockId = 'review-block-' + num + '-' + (++reviewCounter);
 
   var issues = data.issues || [];
   var hasCritical = issues.some(function(i) { return i.severity === 'critical'; });
@@ -742,12 +678,10 @@ async function renderReview(num, data) {
   var badgeText = issues.length === 0 ? '\\u2713 Clean' : issues.length + ' issue' + (issues.length > 1 ? 's' : '');
   var riskColor = data.risk_score >= 7 ? '#f87171' : data.risk_score >= 4 ? '#facc15' : '#4ade80';
   var reviewedAt = data.reviewed_at ? new Date(data.reviewed_at).toLocaleString() : '';
-  var providerLabel = (providerNames[provider] || 'AI') + ' Review';
-
-  var html = '<div class="review-block" id="review-block-' + num + '-' + provider + '">'
+  var html = '<div class="review-block">'
     + '<div class="review-summary" onclick="toggleReviewBlock(\\'' + blockId + '-details\\')" style="cursor:pointer;user-select:none">'
     + '<span class="review-toggle" id="' + blockId + '-arrow">&#9660;</span> '
-    + '<strong>' + esc(providerLabel) + '</strong>'
+    + '<strong>AI Review</strong>'
     + '<span class="review-badge ' + badgeClass + '">' + badgeText + '</span>'
     + (data.risk_score != null ? '<span class="risk-score" style="color:' + riskColor + '">Risk ' + data.risk_score + '/10</span>' : '')
     + (reviewedAt ? '<span style="font-size:11px;color:#475569;margin-left:10px">' + esc(reviewedAt) + '</span>' : '')
@@ -866,12 +800,9 @@ var server = http.createServer(async function(req, res) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
     } else if (req.method === "GET" && req.url.startsWith("/api/review/")) {
-      var urlParts = req.url.split("?");
-      var prNum = parseInt(urlParts[0].split("/").pop());
-      var params = new URLSearchParams(urlParts[1] || "");
-      var provider = params.get("provider") || "claude";
+      var prNum = parseInt(req.url.split("/").pop());
       if (isNaN(prNum)) { res.writeHead(400); res.end("Invalid PR number"); return; }
-      var result = await reviewPR(prNum, provider);
+      var result = await reviewPR(prNum);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } else if (req.method === "GET" && req.url === "/api/target-branch") {
