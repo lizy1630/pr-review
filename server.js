@@ -17,10 +17,12 @@ try {
 var TOKEN = process.env.GITHUB_TOKEN;
 var REPO = process.env.GITHUB_REPO || "InspireHUB/IHUB_Platform";
 var AI_KEY = process.env.ANTHROPIC_API_KEY;
+var GEMINI_KEY = process.env.GEMINI_API_KEY;
+var OPENAI_KEY = process.env.OPENAI_API_KEY;
 var PORT = process.env.PORT || 3000;
 var CHERRY_PICK_TARGET = process.env.CHERRY_PICK_TARGET || "release/v5.9.3";
 
-if (!TOKEN || !AI_KEY) { console.error("Missing GITHUB_TOKEN or ANTHROPIC_API_KEY in .env"); process.exit(1); }
+if (!TOKEN) { console.error("Missing GITHUB_TOKEN in .env"); process.exit(1); }
 
 var SKIP_EXT = [".json", ".lock", ".snap", ".map", ".min.js", ".min.css"];
 var SKIP_PATTERN = [".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.tsx", ".test.jsx", ".stories.tsx", ".stories.ts"];
@@ -175,6 +177,15 @@ async function listPRs() {
 async function listMergedPRs() {
   var prs = await gh("/pulls?state=closed&sort=updated&direction=desc&per_page=30");
   var merged = prs.filter(function(pr) { return pr.merged_at; }).slice(0, 10);
+
+  // Clean up review cache for merged PRs
+  merged.forEach(function(pr) {
+    var file = path.join(REVIEWS_DIR, pr.number + ".json");
+    if (fs.existsSync(file)) {
+      try { fs.unlinkSync(file); } catch(e) {}
+    }
+  });
+
   return merged.map(function(pr) {
     return {
       number: pr.number,
@@ -221,8 +232,72 @@ function setHumanReviewed(prNum, value) {
   return data;
 }
 
-// API: review a single PR
-async function reviewPR(prNum) {
+// Review prompt (shared across providers)
+var REVIEW_PROMPT = "You are a senior code reviewer. Analyze this PR diff for ONLY medium, high, or critical severity bugs and security issues.\n\n"
+  + "Do NOT report: style issues, formatting, naming, low-severity items, test files, or json changes.\n\n"
+  + "Respond ONLY with valid JSON (no markdown, no backticks):\n"
+  + '{"summary":"Brief assessment","issues":[{"severity":"medium|high|critical","category":"bug|security","file":"filename","line":"line","title":"title","description":"explanation","suggestion":"code fix"}],"risk_score":1}\n\n';
+
+function buildPrompt(pr, diff) {
+  return REVIEW_PROMPT + "PR: " + pr.title + " (#" + pr.number + ")\nBranch: " + pr.head.ref + " -> " + pr.base.ref + "\nAuthor: " + pr.user.login + "\n\nDIFF:\n" + diff;
+}
+
+// Provider: Claude
+async function callClaude(prompt) {
+  if (!AI_KEY) throw new Error("ANTHROPIC_API_KEY not set in .env");
+  var r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": AI_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514", max_tokens: 4000,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  if (!r.ok) { var t = await r.text(); throw new Error("Claude API " + r.status + ": " + t); }
+  var d = await r.json();
+  return d.content.map(function(c) { return c.text || ""; }).join("");
+}
+
+// Provider: Gemini
+async function callGemini(prompt) {
+  if (!GEMINI_KEY) throw new Error("GEMINI_API_KEY not set in .env");
+  var r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_KEY, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 4000 }
+    })
+  });
+  if (!r.ok) { var t = await r.text(); throw new Error("Gemini API " + r.status + ": " + t); }
+  var d = await r.json();
+  return d.candidates[0].content.parts.map(function(p) { return p.text || ""; }).join("");
+}
+
+// Provider: GPT
+async function callGPT(prompt) {
+  if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY not set in .env");
+  var r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + OPENAI_KEY },
+    body: JSON.stringify({
+      model: "gpt-4o", max_tokens: 4000,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  if (!r.ok) { var t = await r.text(); throw new Error("GPT API " + r.status + ": " + t); }
+  var d = await r.json();
+  return d.choices[0].message.content;
+}
+
+var PROVIDERS = { claude: callClaude, gemini: callGemini, gpt: callGPT };
+
+// API: review a single PR with a chosen provider
+async function reviewPR(prNum, provider) {
+  provider = provider || "claude";
+  var callFn = PROVIDERS[provider];
+  if (!callFn) throw new Error("Unknown provider: " + provider);
+
   var prs = await gh("/pulls?state=open&per_page=100");
   var pr = prs.find(function(p) { return p.number === prNum; });
   if (!pr) throw new Error("PR #" + prNum + " not found");
@@ -231,32 +306,13 @@ async function reviewPR(prNum) {
   var diff = filterDiff(rawDiff);
 
   if (diff.trim().length < 10) {
-    return { summary: "No reviewable code changes after filtering.", issues: [], risk_score: 0 };
+    return { provider: provider, summary: "No reviewable code changes after filtering.", issues: [], risk_score: 0 };
   }
 
-  var r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": AI_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514", max_tokens: 4000,
-      messages: [{ role: "user", content:
-        "You are a senior code reviewer. Analyze this PR diff for ONLY medium, high, or critical severity bugs and security issues.\n\n"
-        + "Do NOT report: style issues, formatting, naming, low-severity items, test files, or json changes.\n\n"
-        + "Respond ONLY with valid JSON (no markdown, no backticks):\n"
-        + '{"summary":"Brief assessment","issues":[{"severity":"medium|high|critical","category":"bug|security","file":"filename","line":"line","title":"title","description":"explanation","suggestion":"code fix"}],"risk_score":1}\n\n'
-        + "PR: " + pr.title + " (#" + pr.number + ")\n"
-        + "Branch: " + pr.head.ref + " -> " + pr.base.ref + "\n"
-        + "Author: " + pr.user.login + "\n\nDIFF:\n" + diff
-      }]
-    })
-  });
-  if (!r.ok) {
-    var errBody = await r.text();
-    throw new Error("Claude API " + r.status + ": " + errBody);
-  }
-  var d = await r.json();
-  var txt = d.content.map(function(c) { return c.text || ""; }).join("");
+  var prompt = buildPrompt(pr, diff);
+  var txt = await callFn(prompt);
   var parsed = JSON.parse(txt.replace(/```json|```/g, "").trim());
+  parsed.provider = provider;
   var cached = saveCachedReview(prNum, parsed);
   parsed.reviewed_at = cached.reviewed_at;
   return parsed;
@@ -303,17 +359,26 @@ function getHTML() {
   .file-toggle:hover { text-decoration: underline; }
 
   .pr-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
-  .btn-review { background: #818cf8; color: #fff; border: none; padding: 8px 20px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .2s; }
-  .btn-review:hover { background: #6366f1; }
+  .btn-review { color: #fff; border: none; padding: 8px 14px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: background .2s; }
   .btn-review:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
-  .btn-review.reviewing { background: #334155; }
+  .btn-review.reviewing { background: #334155; color: #64748b; }
+  .btn-review.claude { background: #d97706; }
+  .btn-review.claude:hover:not(:disabled) { background: #b45309; }
+  .btn-review.gemini { background: #2563eb; }
+  .btn-review.gemini:hover:not(:disabled) { background: #1d4ed8; }
+  .btn-review.gpt { background: #16a34a; }
+  .btn-review.gpt:hover:not(:disabled) { background: #15803d; }
+  .pr-card.collapsed .btn-review { padding: 4px 8px; font-size: 10px; }
   .btn-github { background: #1e1e2e; color: #e2e8f0; border: 1px solid #334155; padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; transition: background .2s; display: inline-flex; align-items: center; gap: 5px; }
   .btn-github:hover { background: #2d2d44; }
   .jira-badge { display: inline-block; font-size: 11px; padding: 3px 10px; border-radius: 99px; font-weight: 600; background: rgba(129,140,248,.12); color: #818cf8; text-decoration: none; margin-left: 6px; }
   .jira-badge:hover { background: rgba(129,140,248,.25); }
 
   .review-result { padding: 0 20px 16px; }
+  .review-block { margin-bottom: 4px; }
+  .review-toggle { font-size: 10px; color: #475569; margin-right: 2px; }
   .review-summary { font-size: 13px; color: #94a3b8; padding: 12px 0; border-top: 1px solid #1e1e2e; }
+  .review-summary:hover { background: rgba(255,255,255,.02); }
   .review-badge { display: inline-block; font-size: 11px; padding: 3px 10px; border-radius: 99px; font-weight: 600; margin-left: 8px; }
   .badge-clean { background: rgba(74,222,128,.12); color: #4ade80; }
   .badge-issues { background: rgba(250,204,21,.12); color: #facc15; }
@@ -351,7 +416,6 @@ function getHTML() {
   .pr-card.collapsed .pr-meta { display: none; }
   .pr-card.collapsed .pr-avatar { width: 24px; height: 24px; }
   .pr-card.collapsed .pr-actions { gap: 4px; }
-  .pr-card.collapsed .btn-review,
   .pr-card.collapsed .btn-github { padding: 4px 10px; font-size: 11px; }
   .pr-card.collapsed .collapsed-checks { display: flex; }
   .collapsed-checks { display: none; gap: 6px; align-items: center; margin-left: 8px; }
@@ -463,7 +527,9 @@ function renderPRs(prs) {
       + '<div class="pr-actions">'
       + '<button class="expand-btn" id="expand-btn-' + pr.number + '" onclick="toggleCollapse(' + pr.number + ')" style="display:none" title="Expand/Collapse">&#9660;</button>'
       + '<a class="btn-github" href="' + esc(pr.html_url) + '" target="_blank">GitHub</a>'
-      + '<button class="btn-review" id="btn-' + pr.number + '" onclick="reviewPR(' + pr.number + ')">Review with AI</button>'
+      + '<button class="btn-review claude" id="btn-claude-' + pr.number + '" onclick="reviewPR(' + pr.number + ',\\'claude\\')">Claude</button>'
+      + '<button class="btn-review gemini" id="btn-gemini-' + pr.number + '" onclick="reviewPR(' + pr.number + ',\\'gemini\\')">Gemini</button>'
+      + '<button class="btn-review gpt" id="btn-gpt-' + pr.number + '" onclick="reviewPR(' + pr.number + ',\\'gpt\\')">GPT</button>'
       + '<button class="btn-cherry" id="btn-cherry-' + pr.number + '" onclick="cherryPick(' + pr.number + ')" style="display:none">Cherry-pick to ' + esc(targetBranch) + '</button>'
       + '</div>'
       + '</div>'
@@ -528,10 +594,6 @@ async function loadCachedReview(num) {
     setAIChecked(num, true);
     if (data.human_reviewed) setHumanChecked(num, true);
     checkCollapse(num);
-    var btn = document.getElementById('btn-' + num);
-    btn.textContent = 'Re-review with AI';
-    btn.disabled = false;
-    btn.classList.remove('reviewing');
   } catch(e) { /* no cached review, ignore */ }
 }
 
@@ -628,16 +690,22 @@ function toggleFiles(id, btn) {
   else { el.style.display = 'none'; btn.textContent = 'Show files'; }
 }
 
-async function reviewPR(num) {
-  var btn = document.getElementById('btn-' + num);
+var providerNames = { claude: 'Claude', gemini: 'Gemini', gpt: 'GPT' };
+
+async function reviewPR(num, provider) {
+  provider = provider || 'claude';
+  var btn = document.getElementById('btn-' + provider + '-' + num);
   var resultDiv = document.getElementById('result-' + num);
-  btn.disabled = true;
-  btn.classList.add('reviewing');
+  // Disable all 3 buttons while reviewing
+  ['claude','gemini','gpt'].forEach(function(p) {
+    var b = document.getElementById('btn-' + p + '-' + num);
+    if (b) { b.disabled = true; b.classList.add('reviewing'); }
+  });
   btn.textContent = 'Reviewing...';
-  resultDiv.innerHTML = '<div class="review-summary"><span class="spinner"></span> Fetching diff and sending to Claude for review...</div>';
+  resultDiv.innerHTML = '<div class="review-summary"><span class="spinner"></span> Sending to ' + providerNames[provider] + ' for review...</div>';
 
   try {
-    var res = await fetch('/api/review/' + num);
+    var res = await fetch('/api/review/' + num + '?provider=' + provider);
     if (!res.ok) {
       var errText = await res.text();
       throw new Error(errText || 'Review failed');
@@ -646,44 +714,47 @@ async function reviewPR(num) {
     await renderReview(num, data);
     setAIChecked(num, true);
     checkCollapse(num);
-    btn.textContent = 'Re-review with AI';
-    btn.disabled = false;
-    btn.classList.remove('reviewing');
   } catch(e) {
-    resultDiv.innerHTML = '<div class="error-msg">Review failed: ' + esc(e.message) + '</div>';
-    btn.disabled = false;
-    btn.classList.remove('reviewing');
-    btn.textContent = 'Retry Review';
+    resultDiv.innerHTML = '<div class="error-msg">' + providerNames[provider] + ' review failed: ' + esc(e.message) + '</div>';
+  } finally {
+    // Re-enable all buttons
+    ['claude','gemini','gpt'].forEach(function(p) {
+      var b = document.getElementById('btn-' + p + '-' + num);
+      if (b) { b.disabled = false; b.classList.remove('reviewing'); b.textContent = providerNames[p]; }
+    });
   }
 }
 
-async function renderReview(num, data) {
-  var titleEl = document.getElementById('pr-title-' + num);
-  var card = document.getElementById('pr-' + num);
-  var resultDiv = document.getElementById('result-' + num);
+var reviewCounter = 0;
 
-  // Make title a clickable link that toggles review details
-  var titleText = titleEl.textContent;
-  titleEl.innerHTML = '<a href="javascript:void(0)" onclick="toggleReview(' + num + ')">' + esc(titleText) + '</a>';
+async function renderReview(num, data) {
+  var resultDiv = document.getElementById('result-' + num);
+  var provider = data.provider || 'ai';
+  var blockId = 'review-block-' + num + '-' + provider + '-' + (++reviewCounter);
+
+  // Remove previous block from same provider if exists
+  var prev = document.getElementById('review-block-' + num + '-' + provider);
+  if (prev) prev.remove();
 
   var issues = data.issues || [];
   var hasCritical = issues.some(function(i) { return i.severity === 'critical'; });
   var badgeClass = issues.length === 0 ? 'badge-clean' : hasCritical ? 'badge-critical' : 'badge-issues';
   var badgeText = issues.length === 0 ? '\\u2713 Clean' : issues.length + ' issue' + (issues.length > 1 ? 's' : '');
-
   var riskColor = data.risk_score >= 7 ? '#f87171' : data.risk_score >= 4 ? '#facc15' : '#4ade80';
-
   var reviewedAt = data.reviewed_at ? new Date(data.reviewed_at).toLocaleString() : '';
+  var providerLabel = (providerNames[provider] || 'AI') + ' Review';
 
-  var html = '<div class="review-summary">'
-    + '<strong>AI Review</strong>'
+  var html = '<div class="review-block" id="review-block-' + num + '-' + provider + '">'
+    + '<div class="review-summary" onclick="toggleReviewBlock(\\'' + blockId + '-details\\')" style="cursor:pointer;user-select:none">'
+    + '<span class="review-toggle" id="' + blockId + '-arrow">&#9660;</span> '
+    + '<strong>' + esc(providerLabel) + '</strong>'
     + '<span class="review-badge ' + badgeClass + '">' + badgeText + '</span>'
     + (data.risk_score != null ? '<span class="risk-score" style="color:' + riskColor + '">Risk ' + data.risk_score + '/10</span>' : '')
-    + (reviewedAt ? '<span style="font-size:11px;color:#475569;margin-left:10px">Reviewed: ' + esc(reviewedAt) + '</span>' : '')
+    + (reviewedAt ? '<span style="font-size:11px;color:#475569;margin-left:10px">' + esc(reviewedAt) + '</span>' : '')
     + '<br><span style="margin-top:6px;display:inline-block">' + esc(data.summary || '') + '</span>'
     + '</div>';
 
-  html += '<div id="review-details-' + num + '">';
+  html += '<div class="review-details" id="' + blockId + '-details">';
   if (issues.length === 0) {
     html += '<div style="padding:16px 0;text-align:center;color:#4ade80;font-size:14px">No medium+ severity issues found</div>';
   } else {
@@ -706,14 +777,22 @@ async function renderReview(num, data) {
         + '</div>';
     }
   }
-  html += '</div>';
+  html += '</div></div>';
 
-  resultDiv.innerHTML = html;
+  resultDiv.insertAdjacentHTML('beforeend', html);
 }
 
-function toggleReview(num) {
-  var el = document.getElementById('review-details-' + num);
-  if (el) { el.style.display = el.style.display === 'none' ? 'block' : 'none'; }
+function toggleReviewBlock(detailsId) {
+  var el = document.getElementById(detailsId);
+  var arrow = document.getElementById(detailsId.replace('-details', '-arrow'));
+  if (!el) return;
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    if (arrow) arrow.innerHTML = '&#9660;';
+  } else {
+    el.style.display = 'none';
+    if (arrow) arrow.innerHTML = '&#9654;';
+  }
 }
 
 async function cherryPick(num) {
@@ -787,9 +866,12 @@ var server = http.createServer(async function(req, res) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
     } else if (req.method === "GET" && req.url.startsWith("/api/review/")) {
-      var prNum = parseInt(req.url.split("/").pop());
+      var urlParts = req.url.split("?");
+      var prNum = parseInt(urlParts[0].split("/").pop());
+      var params = new URLSearchParams(urlParts[1] || "");
+      var provider = params.get("provider") || "claude";
       if (isNaN(prNum)) { res.writeHead(400); res.end("Invalid PR number"); return; }
-      var result = await reviewPR(prNum);
+      var result = await reviewPR(prNum, provider);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } else if (req.method === "GET" && req.url === "/api/target-branch") {
