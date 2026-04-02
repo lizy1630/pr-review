@@ -1,4 +1,5 @@
 var http = require("http");
+var crypto = require("crypto");
 var fs = require("fs");
 var path = require("path");
 var fetch = require("node-fetch");
@@ -19,8 +20,109 @@ var REPO = process.env.GITHUB_REPO || "InspireHUB/IHUB_Platform";
 var AI_KEY = process.env.ANTHROPIC_API_KEY;
 var PORT = process.env.PORT || 3000;
 var CHERRY_PICK_TARGET = process.env.CHERRY_PICK_TARGET || "release/v5.9.3";
+var SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+var SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+var JIRA_EMAIL = process.env.JIRA_EMAIL;
+var JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
+var JIRA_BASE_URL = process.env.JIRA_BASE_URL || "https://inspirehub.atlassian.net";
 
 if (!TOKEN || !AI_KEY) { console.error("Missing GITHUB_TOKEN or ANTHROPIC_API_KEY in .env"); process.exit(1); }
+
+// Slack: flagged PRs
+var FLAGGED_FILE = path.join(__dirname, "flagged.json");
+
+function getFlagged() {
+  if (!fs.existsSync(FLAGGED_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(FLAGGED_FILE, "utf8")); } catch(e) { return {}; }
+}
+
+function flagPR(prNum, sender) {
+  var data = getFlagged();
+  data[prNum] = { sender: sender, flagged_at: new Date().toISOString() };
+  fs.writeFileSync(FLAGGED_FILE, JSON.stringify(data, null, 2), "utf8");
+  console.log("Flagged PR #" + prNum + " from Slack user: " + sender);
+}
+
+function verifySlackSignature(sigHeader, timestamp, body) {
+  if (!SLACK_SIGNING_SECRET) return false;
+  var baseStr = "v0:" + timestamp + ":" + body;
+  var sig = "v0=" + crypto.createHmac("sha256", SLACK_SIGNING_SECRET).update(baseStr).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(sigHeader));
+}
+
+function extractPRNumbers(text) {
+  var matches = text.match(/github\.com\/[^\/]+\/[^\/]+\/pull\/(\d+)/g);
+  if (!matches) return [];
+  return matches.map(function(m) { return parseInt(m.match(/\/pull\/(\d+)/)[1]); });
+}
+
+// Jira: query tickets awaiting review with mvp/security labels
+async function getJiraPriorityTickets() {
+  if (!JIRA_EMAIL || !JIRA_API_TOKEN) return [];
+  var jql = 'labels in (mvp, security) AND status = "Awaiting Review" ORDER BY updated DESC';
+  var auth = Buffer.from(JIRA_EMAIL + ":" + JIRA_API_TOKEN).toString("base64");
+  var r = await fetch(JIRA_BASE_URL + "/rest/api/3/search/jql?jql=" + encodeURIComponent(jql) + "&fields=summary,status,labels,key&maxResults=50", {
+    headers: { Authorization: "Basic " + auth, Accept: "application/json" }
+  });
+  if (!r.ok) { console.error("Jira API " + r.status); return []; }
+  var d = await r.json();
+  return (d.issues || []).map(function(i) {
+    return { key: i.key, summary: i.fields.summary, labels: i.fields.labels };
+  });
+}
+
+async function doTransition(ticketKey, transitionId, headers) {
+  var r = await fetch(JIRA_BASE_URL + "/rest/api/3/issue/" + ticketKey + "/transitions", {
+    method: "POST", headers: headers,
+    body: JSON.stringify({ transition: { id: transitionId }, fields: {}, update: {} })
+  });
+  if (!r.ok) throw new Error("Transition " + transitionId + " failed: " + r.status);
+}
+
+async function getTransitions(ticketKey, headers) {
+  var r = await fetch(JIRA_BASE_URL + "/rest/api/3/issue/" + ticketKey + "/transitions", { headers: headers });
+  if (!r.ok) throw new Error("Failed to get transitions: " + r.status);
+  var d = await r.json();
+  return d.transitions || [];
+}
+
+function findTransitionByDestName(transitions, namePattern) {
+  return transitions.find(function(t) {
+    var dest = (t.to && t.to.name || "").toLowerCase();
+    return dest.indexOf(namePattern) >= 0;
+  });
+}
+
+
+async function transitionJiraToStaging(ticketKey) {
+  if (!JIRA_EMAIL || !JIRA_API_TOKEN) throw new Error("Jira credentials not set");
+  var auth = Buffer.from(JIRA_EMAIL + ":" + JIRA_API_TOKEN).toString("base64");
+  var headers = { Authorization: "Basic " + auth, Accept: "application/json", "Content-Type": "application/json" };
+
+  var transitions = await getTransitions(ticketKey, headers);
+
+  // Direct path: look for transition that goes to "Staging" or "In Staging"
+  var toStaging = findTransitionByDestName(transitions, "staging");
+  if (toStaging) {
+    await doTransition(ticketKey, toStaging.id, headers);
+    return { status: toStaging.to.name, ticket: ticketKey };
+  }
+
+  // From Awaiting Review: go to "In Review" first, then to Staging
+  var toReview = findTransitionByDestName(transitions, "in review");
+  if (toReview) {
+    await doTransition(ticketKey, toReview.id, headers);
+    var transitions2 = await getTransitions(ticketKey, headers);
+    var toStaging2 = findTransitionByDestName(transitions2, "staging");
+    if (toStaging2) {
+      await doTransition(ticketKey, toStaging2.id, headers);
+      return { status: toStaging2.to.name, ticket: ticketKey };
+    }
+    throw new Error("Moved to In Review but could not find Staging transition for " + ticketKey);
+  }
+
+  throw new Error("No valid transition path to Staging for " + ticketKey + ". Available: " + transitions.map(function(t) { return t.name + " -> " + t.to.name; }).join(", "));
+}
 
 var SKIP_EXT = [".json", ".lock", ".snap", ".map", ".min.js", ".min.css"];
 var SKIP_PATTERN = [".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.tsx", ".test.jsx", ".stories.tsx", ".stories.ts"];
@@ -382,6 +484,16 @@ function getHTML() {
   .expand-btn:hover { color: #818cf8; }
 
   .merged-badge { font-size: 11px; padding: 4px 12px; border-radius: 99px; font-weight: 600; background: rgba(168,85,247,.15); color: #c084fc; }
+  .pr-card.flagged { border-color: #eab308; background: rgba(234,179,8,.08); }
+  .flagged-badge { font-size: 10px; padding: 2px 8px; border-radius: 99px; font-weight: 600; background: rgba(234,179,8,.15); color: #eab308; margin-left: 6px; }
+  .pr-card.jira-priority { border-color: #eab308; background: rgba(234,179,8,.08); }
+  .jira-priority-badge { font-size: 10px; padding: 2px 8px; border-radius: 99px; font-weight: 600; margin-left: 6px; }
+  .jira-priority-badge.mvp { background: rgba(234,179,8,.15); color: #eab308; }
+  .jira-priority-badge.security { background: rgba(239,68,68,.15); color: #ef4444; }
+  .btn-staging { background: #1e1e2e; color: #38bdf8; border: 1px solid #0ea5e9; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; cursor: pointer; transition: background .2s; margin-left: 4px; }
+  .btn-staging:hover { background: #0c4a6e; }
+  .btn-staging:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-staging.done { border-color: #4ade80; color: #4ade80; }
   .merged-card .btn-cherry { display: inline-block; }
 
   .error-msg { color: #f87171; font-size: 12px; padding: 8px 0; }
@@ -400,7 +512,9 @@ function getHTML() {
 var REPO = ${JSON.stringify(REPO)};
 var targetBranch = ${JSON.stringify(CHERRY_PICK_TARGET)};
 
-document.addEventListener('DOMContentLoaded', function() { loadPRs(); loadMergedPRs(); });
+var flaggedPRs = {};
+
+document.addEventListener('DOMContentLoaded', function() { loadPRs().then(function() { loadFlagged(); loadJiraPriority(); }); loadMergedPRs(); setInterval(loadFlagged, 30000); });
 
 async function loadPRs() {
   try {
@@ -422,6 +536,58 @@ async function loadMergedPRs() {
     if (!prs.length) return;
     document.getElementById('merged-heading').style.display = '';
     renderMergedPRs(prs);
+  } catch(e) { /* ignore */ }
+}
+
+async function loadFlagged() {
+  try {
+    var res = await fetch('/api/flagged');
+    if (!res.ok) return;
+    flaggedPRs = await res.json();
+    // Apply/remove flagged highlighting to all cards
+    Object.keys(flaggedPRs).forEach(function(num) {
+      var card = document.getElementById('pr-' + num);
+      if (card && !card.classList.contains('flagged')) {
+        card.classList.add('flagged');
+        var titleRow = card.querySelector('.pr-title-row');
+        if (titleRow && !card.querySelector('.flagged-badge')) {
+          titleRow.insertAdjacentHTML('beforeend', '<span class="flagged-badge">Slack</span>');
+        }
+      }
+    });
+  } catch(e) { /* ignore */ }
+}
+
+async function loadJiraPriority() {
+  try {
+    var res = await fetch('/api/jira-priority');
+    if (!res.ok) return;
+    var tickets = await res.json();
+    // Build a set of ticket keys
+    var ticketMap = {};
+    tickets.forEach(function(t) { ticketMap[t.key] = t.labels; });
+
+    // Find all PR cards and check if their Jira tickets match
+    document.querySelectorAll('.pr-card').forEach(function(card) {
+      var badges = card.querySelectorAll('.jira-badge');
+      badges.forEach(function(badge) {
+        var ticketKey = badge.textContent.trim();
+        if (ticketMap[ticketKey]) {
+          if (!card.classList.contains('jira-priority')) {
+            card.classList.add('jira-priority');
+          }
+          var titleRow = card.querySelector('.pr-title-row');
+          if (titleRow && !card.querySelector('.jira-priority-badge')) {
+            var labels = ticketMap[ticketKey];
+            labels.forEach(function(label) {
+              if (label === 'mvp' || label === 'security') {
+                titleRow.insertAdjacentHTML('beforeend', '<span class="jira-priority-badge ' + label + '">' + label.toUpperCase() + '</span>');
+              }
+            });
+          }
+        }
+      });
+    });
   } catch(e) { /* ignore */ }
 }
 
@@ -477,6 +643,7 @@ function renderPRs(prs) {
       + '<a class="btn-github" href="' + esc(pr.html_url) + '" target="_blank">GitHub</a>'
       + '<button class="btn-review" id="btn-' + pr.number + '" onclick="reviewPR(' + pr.number + ')">Review with AI</button>'
       + '<button class="btn-cherry" id="btn-cherry-' + pr.number + '" onclick="cherryPick(' + pr.number + ')" style="display:none">Cherry-pick to ' + esc(targetBranch) + '</button>'
+      + '<span id="staging-btns-' + pr.number + '" style="display:none"></span>'
       + '</div>'
       + '</div>'
       + '<div class="pr-checks" id="checks-' + pr.number + '">'
@@ -576,6 +743,7 @@ function checkCollapse(num) {
   var expandBtn = document.getElementById('expand-btn-' + num);
   var collapsedChecks = document.getElementById('collapsed-checks-' + num);
   var cherryBtn = document.getElementById('btn-cherry-' + num);
+  var stagingBtns = document.getElementById('staging-btns-' + num);
   var bothChecked = aiCb && aiCb.checked && humanCb && humanCb.checked;
 
   if (bothChecked) {
@@ -584,11 +752,26 @@ function checkCollapse(num) {
     expandBtn.innerHTML = '&#9654;';
     collapsedChecks.innerHTML = '<span class="collapsed-check ai">AI \\u2713</span><span class="collapsed-check human">Human \\u2713</span>';
     if (cherryBtn && !cherryBtn.classList.contains('done')) cherryBtn.style.display = '';
+    // Show staging buttons for each Jira ticket on this card
+    if (stagingBtns) {
+      if (!stagingBtns.dataset.rendered) {
+        var badges = card.querySelectorAll('.jira-badge');
+        var html = '';
+        badges.forEach(function(b) {
+          var key = b.textContent.trim();
+          html += '<button class="btn-staging" id="staging-' + key + '" onclick="moveToStaging(\\'' + key + '\\')">Move ' + key + ' to Staging</button>';
+        });
+        stagingBtns.innerHTML = html;
+        stagingBtns.dataset.rendered = '1';
+      }
+      stagingBtns.style.display = '';
+    }
   } else {
     card.classList.remove('collapsed');
     expandBtn.style.display = 'none';
     collapsedChecks.innerHTML = '';
     if (cherryBtn && !cherryBtn.classList.contains('done')) cherryBtn.style.display = 'none';
+    if (stagingBtns) stagingBtns.style.display = 'none';
   }
 }
 
@@ -754,6 +937,25 @@ async function cherryPick(num) {
     resultDiv.innerHTML = '<div class="cherry-result error">Cherry-pick failed: ' + esc(e.message) + '</div>';
   }
 }
+async function moveToStaging(ticketKey) {
+  var btn = document.getElementById('staging-' + ticketKey);
+  if (!confirm('Move ' + ticketKey + ' to Staging in Jira?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Moving...';
+  try {
+    var res = await fetch('/api/jira-staging/' + ticketKey, { method: 'POST' });
+    if (!res.ok) {
+      var errText = await res.text();
+      throw new Error(errText || 'Failed');
+    }
+    btn.textContent = ticketKey + ' → Staging';
+    btn.classList.add('done');
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = 'Retry ' + ticketKey;
+    alert('Failed to move ' + ticketKey + ' to Staging: ' + e.message);
+  }
+}
 </script>
 </body>
 </html>`;
@@ -814,6 +1016,47 @@ var server = http.createServer(async function(req, res) {
       var result = await cherryPickPR(prNum, CHERRY_PICK_TARGET);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
+    } else if (req.method === "GET" && req.url === "/api/flagged") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(getFlagged()));
+    } else if (req.method === "GET" && req.url === "/api/jira-priority") {
+      var tickets = await getJiraPriorityTickets();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(tickets));
+    } else if (req.method === "POST" && req.url.startsWith("/api/jira-staging/")) {
+      var ticketKey = decodeURIComponent(req.url.split("/").pop());
+      var result = await transitionJiraToStaging(ticketKey);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+    } else if (req.method === "POST" && req.url === "/slack/events") {
+      var body = "";
+      req.on("data", function(c) { body += c; });
+      await new Promise(function(resolve) { req.on("end", resolve); });
+
+      // Verify Slack signature
+      var sigHeader = req.headers["x-slack-signature"] || "";
+      var timestamp = req.headers["x-slack-request-timestamp"] || "";
+      if (SLACK_SIGNING_SECRET && sigHeader && !verifySlackSignature(sigHeader, timestamp, body)) {
+        res.writeHead(401); res.end("Invalid signature"); return;
+      }
+
+      var payload = JSON.parse(body);
+
+      // Slack URL verification challenge
+      if (payload.type === "url_verification") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ challenge: payload.challenge }));
+        return;
+      }
+
+      // Handle message events
+      if (payload.event && payload.event.type === "message" && payload.event.text) {
+        var prNums = extractPRNumbers(payload.event.text);
+        var sender = payload.event.user || "unknown";
+        prNums.forEach(function(n) { flagPR(n, sender); });
+      }
+
+      res.writeHead(200); res.end("ok");
     } else {
       res.writeHead(404);
       res.end("Not found");
