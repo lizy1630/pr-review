@@ -939,16 +939,24 @@ async function cherryPick(num) {
 }
 async function moveToStaging(ticketKey) {
   var btn = document.getElementById('staging-' + ticketKey);
-  if (!confirm('Move ' + ticketKey + ' to Staging in Jira?')) return;
+  var timeSpent = prompt('Move ' + ticketKey + ' to Staging.\\nLog time spent (e.g. 30m, 1h, 1h 30m). Leave empty to skip:', '30m');
+  if (timeSpent === null) return; // cancelled
   btn.disabled = true;
   btn.textContent = 'Moving...';
   try {
-    var res = await fetch('/api/jira-staging/' + ticketKey, { method: 'POST' });
+    var body = {};
+    if (timeSpent.trim()) body.timeSpent = timeSpent.trim();
+    var res = await fetch('/api/jira-staging/' + ticketKey, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
     if (!res.ok) {
       var errText = await res.text();
       throw new Error(errText || 'Failed');
     }
-    btn.textContent = ticketKey + ' → Staging';
+    var suffix = timeSpent.trim() ? ' (' + timeSpent.trim() + ' logged)' : '';
+    btn.textContent = ticketKey + ' → Staging' + suffix;
     btn.classList.add('done');
   } catch(e) {
     btn.disabled = false;
@@ -1025,7 +1033,22 @@ var server = http.createServer(async function(req, res) {
       res.end(JSON.stringify(tickets));
     } else if (req.method === "POST" && req.url.startsWith("/api/jira-staging/")) {
       var ticketKey = decodeURIComponent(req.url.split("/").pop());
+      var body = "";
+      req.on("data", function(c) { body += c; });
+      await new Promise(function(resolve) { req.on("end", resolve); });
+      var parsed = body ? JSON.parse(body) : {};
       var result = await transitionJiraToStaging(ticketKey);
+      // Log time if provided
+      if (parsed.timeSpent) {
+        var auth = Buffer.from(JIRA_EMAIL + ":" + JIRA_API_TOKEN).toString("base64");
+        var wl = await fetch(JIRA_BASE_URL + "/rest/api/3/issue/" + ticketKey + "/worklog", {
+          method: "POST",
+          headers: { Authorization: "Basic " + auth, Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ timeSpent: parsed.timeSpent, comment: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "Code review" }] }] } })
+        });
+        if (!wl.ok) { var wlErr = await wl.text(); console.error("Worklog failed:", wlErr); }
+        else { result.timeLogged = parsed.timeSpent; }
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } else if (req.method === "POST" && req.url === "/slack/events") {
@@ -1050,8 +1073,12 @@ var server = http.createServer(async function(req, res) {
       }
 
       // Handle message events
-      if (payload.event && payload.event.type === "message" && payload.event.text) {
-        var prNums = extractPRNumbers(payload.event.text);
+      console.log("Slack event:", payload.event ? payload.event.type : payload.type, payload.event ? (payload.event.text || "(no text)").substring(0, 100) : "");
+      if (payload.event && payload.event.type === "message") {
+        var text = payload.event.text || "";
+        // Slack sometimes wraps URLs in angle brackets: <https://...>
+        text = text.replace(/<(https?:\/\/[^|>]+)(?:\|[^>]*)?>/g, "$1");
+        var prNums = extractPRNumbers(text);
         var sender = payload.event.user || "unknown";
         prNums.forEach(function(n) { flagPR(n, sender); });
       }
