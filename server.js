@@ -252,13 +252,29 @@ function filterDiff(raw) {
   return result.length > 28000 ? result.substring(0, 28000) + "\n...(truncated)" : result;
 }
 
-// API: list PRs from last 2 weeks (no file fetching — fast)
+// File count cache on disk
+var FILE_CACHE_PATH = path.join(__dirname, "file-cache.json");
+
+function getFileCache() {
+  if (!fs.existsSync(FILE_CACHE_PATH)) return {};
+  try { return JSON.parse(fs.readFileSync(FILE_CACHE_PATH, "utf8")); } catch(e) { return {}; }
+}
+
+function saveFileCache(prNum, data) {
+  var cache = getFileCache();
+  cache[prNum] = { kept: data.kept, skipped: data.skipped, updated_at: new Date().toISOString() };
+  fs.writeFileSync(FILE_CACHE_PATH, JSON.stringify(cache, null, 2), "utf8");
+}
+
+// API: list PRs from last 4 weeks (fast, uses cached file counts)
 async function listPRs() {
-  var twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  var fourWeeksAgo = new Date(Date.now() - 28 * 24 * 60 * 60 * 1000).toISOString();
   var prs = await gh("/pulls?state=open&sort=created&direction=desc&per_page=100");
-  var recent = prs.filter(function(pr) { return pr.created_at >= twoWeeksAgo; });
+  var recent = prs.filter(function(pr) { return pr.created_at >= fourWeeksAgo; });
+  var fileCache = getFileCache();
 
   return recent.map(function(pr) {
+    var cached = fileCache[pr.number];
     return {
       number: pr.number,
       title: pr.title,
@@ -268,7 +284,9 @@ async function listPRs() {
       branch: pr.head.ref,
       base: pr.base.ref,
       created_at: pr.created_at,
-      html_url: pr.html_url
+      html_url: pr.html_url,
+      file_count: cached ? cached.kept.length : null,
+      skipped_count: cached ? cached.skipped.length : null
     };
   });
 }
@@ -498,13 +516,25 @@ function getHTML() {
 
   .error-msg { color: #f87171; font-size: 12px; padding: 8px 0; }
   .no-prs { text-align: center; padding: 60px; color: #475569; }
+  .sort-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
+  .sort-bar label { font-size: 12px; color: #64748b; }
+  .sort-btn { background: #1e1e2e; color: #94a3b8; border: 1px solid #334155; padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all .2s; }
+  .sort-btn:hover { border-color: #818cf8; color: #e2e8f0; }
+  .sort-btn.active { background: #818cf8; color: #fff; border-color: #818cf8; }
+  .sort-arrow { font-size: 10px; margin-left: 2px; }
 </style>
 </head>
 <body>
 <div class="container">
   <h1>PR Review Dashboard</h1>
   <div class="subtitle" id="subtitle">Loading...</div>
-  <div id="content"><div class="loading"><span class="spinner"></span> Fetching PRs from the last 2 weeks...</div></div>
+  <div class="sort-bar" id="sort-bar" style="display:none">
+    <label>Sort by:</label>
+    <button class="sort-btn active" onclick="sortPRs('date')" id="sort-date">Date <span class="sort-arrow">&#9660;</span></button>
+    <button class="sort-btn" onclick="sortPRs('tagged')" id="sort-tagged">Tagged <span class="sort-arrow">&#9660;</span></button>
+    <button class="sort-btn" onclick="sortPRs('files')" id="sort-files">Files <span class="sort-arrow">&#9660;</span></button>
+  </div>
+  <div id="content"><div class="loading"><span class="spinner"></span> Fetching PRs from the last 4 weeks...</div></div>
   <h2 id="merged-heading" style="font-size:18px;margin-top:32px;margin-bottom:12px;display:none">Recently Merged</h2>
   <div id="merged-content"></div>
 </div>
@@ -513,6 +543,9 @@ var REPO = ${JSON.stringify(REPO)};
 var targetBranch = ${JSON.stringify(CHERRY_PICK_TARGET)};
 
 var flaggedPRs = {};
+var allPRs = [];
+var currentSort = 'date';
+var prFileCount = {}; // num -> file count, populated by loadFiles
 
 document.addEventListener('DOMContentLoaded', function() { loadPRs().then(function() { loadFlagged(); loadJiraPriority(); }); loadMergedPRs(); setInterval(loadFlagged, 30000); });
 
@@ -521,7 +554,8 @@ async function loadPRs() {
     var res = await fetch('/api/prs');
     if (!res.ok) throw new Error('Failed to fetch PRs');
     var prs = await res.json();
-    document.getElementById('subtitle').textContent = REPO + ' | PRs created in the last 2 weeks | ' + new Date().toLocaleDateString();
+    allPRs = prs;
+    document.getElementById('subtitle').textContent = REPO + ' | PRs created in the last 4 weeks | ' + new Date().toLocaleDateString();
     renderPRs(prs);
   } catch(e) {
     document.getElementById('content').innerHTML = '<div class="error-msg">Error: ' + esc(e.message) + '</div>';
@@ -612,14 +646,57 @@ function extractJiraTickets(pr) {
   return matches.filter(function(t) { if (seen[t]) return false; seen[t] = true; return true; });
 }
 
+var sortDir = { date: 'desc', tagged: 'desc', files: 'desc' };
+
+function sortPRs(by) {
+  // Toggle direction if clicking same sort, otherwise default desc
+  if (currentSort === by) {
+    sortDir[by] = sortDir[by] === 'desc' ? 'asc' : 'desc';
+  } else {
+    currentSort = by;
+  }
+  var dir = sortDir[by] === 'asc' ? 1 : -1;
+
+  // Update button states and arrows
+  document.querySelectorAll('.sort-btn').forEach(function(b) { b.classList.remove('active'); });
+  var activeBtn = document.getElementById('sort-' + by);
+  activeBtn.classList.add('active');
+  activeBtn.querySelector('.sort-arrow').innerHTML = sortDir[by] === 'desc' ? '&#9660;' : '&#9650;';
+
+  // Sort by reordering DOM nodes — no re-render
+  var container = document.getElementById('content');
+  var cards = allPRs.slice();
+
+  if (by === 'date') {
+    cards.sort(function(a, b) { return dir * (new Date(b.created_at) - new Date(a.created_at)); });
+  } else if (by === 'tagged') {
+    cards.sort(function(a, b) {
+      var aTagged = flaggedPRs[a.number] || document.getElementById('pr-' + a.number).classList.contains('jira-priority') ? 1 : 0;
+      var bTagged = flaggedPRs[b.number] || document.getElementById('pr-' + b.number).classList.contains('jira-priority') ? 1 : 0;
+      if (aTagged !== bTagged) return dir * (bTagged - aTagged);
+      return dir * (new Date(b.created_at) - new Date(a.created_at));
+    });
+  } else if (by === 'files') {
+    cards.sort(function(a, b) { return dir * ((prFileCount[b.number] || 0) - (prFileCount[a.number] || 0)); });
+  }
+
+  cards.forEach(function(pr) {
+    var el = document.getElementById('pr-' + pr.number);
+    if (el) container.appendChild(el);
+  });
+}
+
 function renderPRs(prs) {
   if (!prs.length) {
-    document.getElementById('content').innerHTML = '<div class="no-prs">No PRs created in the last 2 weeks.</div>';
+    document.getElementById('content').innerHTML = '<div class="no-prs">No PRs created in the last 4 weeks.</div>';
     return;
   }
+  document.getElementById('sort-bar').style.display = '';
   var html = '';
   prs.forEach(function(pr) {
     prMeta[pr.number] = { branch: pr.branch, html_url: pr.html_url };
+    var fileCountText = pr.file_count != null ? pr.file_count + ' files' : '...';
+    if (pr.file_count != null) prFileCount[pr.number] = pr.file_count;
     var created = new Date(pr.created_at).toLocaleDateString();
     var tickets = extractJiraTickets(pr);
     var ticketHtml = tickets.map(function(t) {
@@ -634,6 +711,7 @@ function renderPRs(prs) {
       + '<span class="pr-number">#' + pr.number + '</span>'
       + '<span class="pr-title" id="pr-title-' + pr.number + '">' + esc(pr.title) + '</span>'
       + ticketHtml
+      + '<span style="font-size:11px;color:#64748b;margin-left:6px" id="file-count-' + pr.number + '">' + fileCountText + '</span>'
       + '<div class="collapsed-checks" id="collapsed-checks-' + pr.number + '"></div>'
       + '</div>'
       + '<div class="pr-meta">' + esc(pr.author) + ' | ' + esc(pr.branch) + ' &rarr; ' + esc(pr.base) + ' | ' + created + '</div>'
@@ -658,11 +736,40 @@ function renderPRs(prs) {
       + '</div>';
   });
   document.getElementById('content').innerHTML = html;
-  // Lazy-load file info and cached reviews for each PR
   prs.forEach(function(pr) {
-    loadFiles(pr.number);
     loadCachedReview(pr.number);
+    loadFiles(pr.number);
   });
+}
+
+async function loadFiles(num) {
+  var section = document.getElementById('files-section-' + num);
+  try {
+    var res = await fetch('/api/files/' + num);
+    if (!res.ok) throw new Error('Failed');
+    var files = await res.json();
+    var reviewFiles = files.kept || [];
+    var skippedFiles = files.skipped || [];
+    prFileCount[num] = reviewFiles.length;
+    // Update inline count
+    var countEl = document.getElementById('file-count-' + num);
+    if (countEl) countEl.textContent = reviewFiles.length + ' files';
+    section.innerHTML =
+      '<div class="file-group"><div class="file-group-label">Files to review (' + reviewFiles.length + ')</div>'
+      + '<ul class="file-list" id="review-files-' + num + '" style="display:none">'
+      + reviewFiles.map(function(f) { return '<li>' + esc(f) + '</li>'; }).join('')
+      + '</ul>'
+      + (reviewFiles.length ? '<button class="file-toggle" onclick="toggleFiles(\\'review-files-' + num + '\\', this)">Show files</button>' : '')
+      + '</div>'
+      + '<div class="file-group"><div class="file-group-label">Skipped (' + skippedFiles.length + ')</div>'
+      + '<ul class="file-list" id="skipped-files-' + num + '" style="display:none">'
+      + skippedFiles.map(function(f) { return '<li class="skipped">' + esc(f) + '</li>'; }).join('')
+      + '</ul>'
+      + (skippedFiles.length ? '<button class="file-toggle" onclick="toggleFiles(\\'skipped-files-' + num + '\\', this)">Show files</button>' : '')
+      + '</div>';
+  } catch(e) {
+    section.innerHTML = '<span style="font-size:11px;color:#f87171">Failed to load files</span>';
+  }
 }
 
 function renderMergedPRs(prs) {
@@ -787,31 +894,6 @@ function toggleCollapse(num) {
   }
 }
 
-async function loadFiles(num) {
-  var section = document.getElementById('files-section-' + num);
-  try {
-    var res = await fetch('/api/files/' + num);
-    if (!res.ok) throw new Error('Failed');
-    var files = await res.json();
-    var reviewFiles = files.kept || [];
-    var skippedFiles = files.skipped || [];
-    section.innerHTML =
-      '<div class="file-group"><div class="file-group-label">Files to review (' + reviewFiles.length + ')</div>'
-      + '<ul class="file-list" id="review-files-' + num + '" style="display:none">'
-      + reviewFiles.map(function(f) { return '<li>' + esc(f) + '</li>'; }).join('')
-      + '</ul>'
-      + (reviewFiles.length ? '<button class="file-toggle" onclick="toggleFiles(\\'review-files-' + num + '\\', this)">Show files</button>' : '')
-      + '</div>'
-      + '<div class="file-group"><div class="file-group-label">Skipped (' + skippedFiles.length + ')</div>'
-      + '<ul class="file-list" id="skipped-files-' + num + '" style="display:none">'
-      + skippedFiles.map(function(f) { return '<li class="skipped">' + esc(f) + '</li>'; }).join('')
-      + '</ul>'
-      + (skippedFiles.length ? '<button class="file-toggle" onclick="toggleFiles(\\'skipped-files-' + num + '\\', this)">Show files</button>' : '')
-      + '</div>';
-  } catch(e) {
-    section.innerHTML = '<span style="font-size:11px;color:#f87171">Failed to load files</span>';
-  }
-}
 
 function toggleFiles(id, btn) {
   var el = document.getElementById(id);
@@ -987,6 +1069,7 @@ var server = http.createServer(async function(req, res) {
       var prNum = parseInt(req.url.split("/").pop());
       if (isNaN(prNum)) { res.writeHead(400); res.end("Invalid PR number"); return; }
       var files = await getFiles(prNum);
+      saveFileCache(prNum, files);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(files));
     } else if (req.method === "GET" && req.url.startsWith("/api/cached-review/")) {
