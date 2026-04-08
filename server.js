@@ -125,7 +125,7 @@ async function transitionJiraToStaging(ticketKey) {
 }
 
 var SKIP_EXT = [".json", ".lock", ".snap", ".map", ".min.js", ".min.css"];
-var SKIP_PATTERN = [".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.tsx", ".test.jsx", ".stories.tsx", ".stories.ts"];
+var SKIP_PATTERN = [".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.tsx", ".test.jsx", ".stories.tsx", ".stories.ts", "Test.cs", "interface.ts"];
 
 function skipFile(name) {
   if (SKIP_EXT.some(function(e) { return name.endsWith(e); })) return true;
@@ -248,8 +248,36 @@ function filterDiff(raw) {
     var m = s.match(/^diff --git a\/(.+?) b\//);
     return !m || !skipFile(m[1]);
   });
-  var result = filtered.join("");
-  return result.length > 28000 ? result.substring(0, 28000) + "\n...(truncated)" : result;
+  var minified = filtered.map(function(section) {
+    var lines = section.split("\n");
+    var out = [];
+    var prev = null;
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      // Keep file headers and hunk positions
+      if (line.startsWith("diff --git") || line.startsWith("---") || line.startsWith("+++") || line.startsWith("@@")) {
+        out.push(line);
+        prev = line;
+        continue;
+      }
+      // Skip meta lines
+      if (line.startsWith("index ") || line.startsWith("similarity index") || line.startsWith("rename from") || line.startsWith("rename to") || line.startsWith("new file") || line.startsWith("deleted file")) continue;
+      // Keep changed lines
+      if (line.startsWith("+") || line.startsWith("-")) {
+        // Add 1 line of context before a change block
+        if (prev && !prev.startsWith("+") && !prev.startsWith("-") && !prev.startsWith("@@") && !prev.startsWith("diff") && !prev.startsWith("---") && !prev.startsWith("+++")) {
+          out.push(prev);
+        }
+        out.push(line);
+        prev = line;
+        continue;
+      }
+      prev = line;
+    }
+    return out.join("\n");
+  });
+  var result = minified.join("\n");
+  return result.length > 80000 ? result.substring(0, 80000) + "\n...(truncated)" : result;
 }
 
 // File count cache on disk
@@ -266,15 +294,16 @@ function saveFileCache(prNum, data) {
   fs.writeFileSync(FILE_CACHE_PATH, JSON.stringify(cache, null, 2), "utf8");
 }
 
-// API: list PRs from last 4 weeks (fast, uses cached file counts)
+// API: list PRs updated in last 4 weeks (fast, uses cached file counts)
 async function listPRs() {
   var fourWeeksAgo = new Date(Date.now() - 28 * 24 * 60 * 60 * 1000).toISOString();
-  var prs = await gh("/pulls?state=open&sort=created&direction=desc&per_page=100");
-  var recent = prs.filter(function(pr) { return pr.created_at >= fourWeeksAgo; });
+  var prs = await gh("/pulls?state=open&sort=updated&direction=desc&per_page=100");
+  var recent = prs.filter(function(pr) { return pr.updated_at >= fourWeeksAgo; });
   var fileCache = getFileCache();
 
   return recent.map(function(pr) {
     var cached = fileCache[pr.number];
+    var review = getCachedReview(pr.number);
     return {
       number: pr.number,
       title: pr.title,
@@ -284,9 +313,12 @@ async function listPRs() {
       branch: pr.head.ref,
       base: pr.base.ref,
       created_at: pr.created_at,
+      updated_at: pr.updated_at,
       html_url: pr.html_url,
       file_count: cached ? cached.kept.length : null,
-      skipped_count: cached ? cached.skipped.length : null
+      skipped_count: cached ? cached.skipped.length : null,
+      ai_reviewed: !!(review && review.result),
+      human_reviewed: !!(review && review.human_reviewed)
     };
   });
 }
@@ -350,14 +382,24 @@ function setHumanReviewed(prNum, value) {
   return data;
 }
 
-// Review prompt (shared across providers)
-var REVIEW_PROMPT = "You are a senior code reviewer. Analyze this PR diff for ONLY medium, high, or critical severity bugs and security issues.\n\n"
-  + "Do NOT report: style issues, formatting, naming, low-severity items, test files, or json changes.\n\n"
-  + "Respond ONLY with valid JSON (no markdown, no backticks):\n"
-  + '{"summary":"Brief assessment","issues":[{"severity":"medium|high|critical","category":"bug|security","file":"filename","line":"line","title":"title","description":"explanation","suggestion":"code fix"}],"risk_score":1}\n\n';
+// Review system prompt (persona + output schema)
+var REVIEW_SYSTEM = "You are a senior code reviewer with deep expertise in security and software reliability. "
+  + "Your job is to find real bugs and security vulnerabilities — issues that would break production or expose the system to attack.\n\n"
+  + "Rules:\n"
+  + "- ONLY report medium, high, or critical severity issues.\n"
+  + "- Focus on: logic errors, race conditions, null/undefined access, injection vulnerabilities, auth/authz flaws, data leaks, resource leaks, error handling gaps that lose data.\n"
+  + "- Do NOT report: style, formatting, naming, low-severity items, test-only issues, or JSON/config file changes.\n"
+  + "- If there are no real issues, return an empty issues array — do not invent problems.\n\n"
+  + "Respond ONLY with valid JSON (no markdown, no backticks). Schema:\n"
+  + '{"summary":"1-2 sentence assessment of the PR","issues":[{"severity":"medium|high|critical","category":"bug|security","file":"filename","line":"line number or range","title":"short title","description":"what is wrong and why it matters","suggestion":"concrete code fix"}],"risk_score":0-10}\n'
+  + "risk_score: 0 = trivial/no issues, 3 = minor concerns, 5 = needs attention, 8+ = blocking issues.";
 
 function buildPrompt(pr, diff) {
-  return REVIEW_PROMPT + "PR: " + pr.title + " (#" + pr.number + ")\nBranch: " + pr.head.ref + " -> " + pr.base.ref + "\nAuthor: " + pr.user.login + "\n\nDIFF:\n" + diff;
+  return "PR: " + pr.title + " (#" + pr.number + ")\n"
+    + "Description: " + (pr.body || "No description provided") + "\n"
+    + "Branch: " + pr.head.ref + " -> " + pr.base.ref + "\n"
+    + "Author: " + pr.user.login + "\n\n"
+    + "DIFF:\n" + diff;
 }
 
 // API: review a single PR with Claude
@@ -378,7 +420,8 @@ async function reviewPR(prNum) {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": AI_KEY, "anthropic-version": "2023-06-01" },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514", max_tokens: 4000,
+      model: "claude-sonnet-4-20250514", max_tokens: 8000,
+      system: REVIEW_SYSTEM,
       messages: [{ role: "user", content: prompt }]
     })
   });
@@ -516,6 +559,10 @@ function getHTML() {
 
   .error-msg { color: #f87171; font-size: 12px; padding: 8px 0; }
   .no-prs { text-align: center; padding: 60px; color: #475569; }
+  .pr-card.reviewed { border-color: #22c55e; background: rgba(34,197,94,.08); }
+  .btn-copy-diff { background: #1e1e2e; color: #94a3b8; border: 1px solid #334155; padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all .2s; }
+  .btn-copy-diff:hover { background: #2d2d44; border-color: #818cf8; color: #e2e8f0; }
+  .btn-copy-diff.copied { background: #166534; color: #4ade80; border-color: #166534; }
   .sort-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
   .sort-bar label { font-size: 12px; color: #64748b; }
   .sort-btn { background: #1e1e2e; color: #94a3b8; border: 1px solid #334155; padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all .2s; }
@@ -534,7 +581,7 @@ function getHTML() {
     <button class="sort-btn" onclick="sortPRs('tagged')" id="sort-tagged">Tagged <span class="sort-arrow">&#9660;</span></button>
     <button class="sort-btn" onclick="sortPRs('files')" id="sort-files">Files <span class="sort-arrow">&#9660;</span></button>
   </div>
-  <div id="content"><div class="loading"><span class="spinner"></span> Fetching PRs from the last 4 weeks...</div></div>
+  <div id="content"><div class="loading"><span class="spinner"></span> Fetching PRs updated in the last 4 weeks...</div></div>
   <h2 id="merged-heading" style="font-size:18px;margin-top:32px;margin-bottom:12px;display:none">Recently Merged</h2>
   <div id="merged-content"></div>
 </div>
@@ -555,7 +602,7 @@ async function loadPRs() {
     if (!res.ok) throw new Error('Failed to fetch PRs');
     var prs = await res.json();
     allPRs = prs;
-    document.getElementById('subtitle').textContent = REPO + ' | PRs created in the last 4 weeks | ' + new Date().toLocaleDateString();
+    document.getElementById('subtitle').textContent = REPO + ' | PRs updated in the last 4 weeks | ' + new Date().toLocaleDateString();
     renderPRs(prs);
   } catch(e) {
     document.getElementById('content').innerHTML = '<div class="error-msg">Error: ' + esc(e.message) + '</div>';
@@ -648,6 +695,14 @@ function extractJiraTickets(pr) {
 
 var sortDir = { date: 'desc', tagged: 'desc', files: 'desc' };
 
+function isReviewed(num) {
+  var card = document.getElementById('pr-' + num);
+  if (!card) return false;
+  var aiCb = document.getElementById('cb-ai-' + num);
+  var humanCb = document.getElementById('cb-human-' + num);
+  return (aiCb && aiCb.checked) || (humanCb && humanCb.checked);
+}
+
 function sortPRs(by) {
   // Toggle direction if clicking same sort, otherwise default desc
   if (currentSort === by) {
@@ -667,18 +722,24 @@ function sortPRs(by) {
   var container = document.getElementById('content');
   var cards = allPRs.slice();
 
+  // Primary sort by the selected criteria
   if (by === 'date') {
-    cards.sort(function(a, b) { return dir * (new Date(b.created_at) - new Date(a.created_at)); });
+    cards.sort(function(a, b) { return dir * (new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at)); });
   } else if (by === 'tagged') {
     cards.sort(function(a, b) {
       var aTagged = flaggedPRs[a.number] || document.getElementById('pr-' + a.number).classList.contains('jira-priority') ? 1 : 0;
       var bTagged = flaggedPRs[b.number] || document.getElementById('pr-' + b.number).classList.contains('jira-priority') ? 1 : 0;
       if (aTagged !== bTagged) return dir * (bTagged - aTagged);
-      return dir * (new Date(b.created_at) - new Date(a.created_at));
+      return dir * (new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
     });
   } else if (by === 'files') {
     cards.sort(function(a, b) { return dir * ((prFileCount[b.number] || 0) - (prFileCount[a.number] || 0)); });
   }
+
+  // Always float reviewed (not merged) PRs to the top, preserving their relative order
+  var reviewed = cards.filter(function(pr) { return isReviewed(pr.number); });
+  var unreviewed = cards.filter(function(pr) { return !isReviewed(pr.number); });
+  cards = reviewed.concat(unreviewed);
 
   cards.forEach(function(pr) {
     var el = document.getElementById('pr-' + pr.number);
@@ -688,7 +749,7 @@ function sortPRs(by) {
 
 function renderPRs(prs) {
   if (!prs.length) {
-    document.getElementById('content').innerHTML = '<div class="no-prs">No PRs created in the last 4 weeks.</div>';
+    document.getElementById('content').innerHTML = '<div class="no-prs">No PRs updated in the last 4 weeks.</div>';
     return;
   }
   document.getElementById('sort-bar').style.display = '';
@@ -698,12 +759,13 @@ function renderPRs(prs) {
     var fileCountText = pr.file_count != null ? pr.file_count + ' files' : '...';
     if (pr.file_count != null) prFileCount[pr.number] = pr.file_count;
     var created = new Date(pr.created_at).toLocaleDateString();
+    var updated = new Date(pr.updated_at).toLocaleDateString();
     var tickets = extractJiraTickets(pr);
     var ticketHtml = tickets.map(function(t) {
       return '<a class="jira-badge" href="' + JIRA_BASE + t + '" target="_blank">' + t + '</a>';
     }).join('');
 
-    html += '<div class="pr-card" id="pr-' + pr.number + '">'
+    html += '<div class="pr-card' + (pr.ai_reviewed && pr.human_reviewed ? ' reviewed' : '') + '" id="pr-' + pr.number + '" data-ai-reviewed="' + (pr.ai_reviewed ? '1' : '0') + '" data-human-reviewed="' + (pr.human_reviewed ? '1' : '0') + '">'
       + '<div class="pr-header">'
       + '<img class="pr-avatar" src="' + esc(pr.avatar) + '" alt="">'
       + '<div class="pr-info">'
@@ -714,11 +776,12 @@ function renderPRs(prs) {
       + '<span style="font-size:11px;color:#64748b;margin-left:6px" id="file-count-' + pr.number + '">' + fileCountText + '</span>'
       + '<div class="collapsed-checks" id="collapsed-checks-' + pr.number + '"></div>'
       + '</div>'
-      + '<div class="pr-meta">' + esc(pr.author) + ' | ' + esc(pr.branch) + ' &rarr; ' + esc(pr.base) + ' | ' + created + '</div>'
+      + '<div class="pr-meta">' + esc(pr.author) + ' | ' + esc(pr.branch) + ' &rarr; ' + esc(pr.base) + ' | created ' + created + ' | updated ' + updated + '</div>'
       + '</div>'
       + '<div class="pr-actions">'
       + '<button class="expand-btn" id="expand-btn-' + pr.number + '" onclick="toggleCollapse(' + pr.number + ')" style="display:none" title="Expand/Collapse">&#9660;</button>'
       + '<a class="btn-github" href="' + esc(pr.html_url) + '" target="_blank">GitHub</a>'
+      + '<button class="btn-copy-diff" id="btn-diff-' + pr.number + '" onclick="copyDiff(' + pr.number + ')">Copy Diff</button>'
       + '<button class="btn-review" id="btn-' + pr.number + '" onclick="reviewPR(' + pr.number + ')">Review with AI</button>'
       + '<button class="btn-cherry" id="btn-cherry-' + pr.number + '" onclick="cherryPick(' + pr.number + ')" style="display:none">Cherry-pick to ' + esc(targetBranch) + '</button>'
       + '<span id="staging-btns-' + pr.number + '" style="display:none"></span>'
@@ -736,10 +799,10 @@ function renderPRs(prs) {
       + '</div>';
   });
   document.getElementById('content').innerHTML = html;
-  prs.forEach(function(pr) {
-    loadCachedReview(pr.number);
-    loadFiles(pr.number);
-  });
+  // Load cached reviews and files, then re-sort to float reviewed to top
+  var reviewPromises = prs.map(function(pr) { return loadCachedReview(pr.number); });
+  prs.forEach(function(pr) { loadFiles(pr.number); });
+  Promise.all(reviewPromises).then(function() { sortPRs(currentSort); });
 }
 
 async function loadFiles(num) {
@@ -899,6 +962,25 @@ function toggleFiles(id, btn) {
   var el = document.getElementById(id);
   if (el.style.display === 'none') { el.style.display = 'block'; btn.textContent = 'Hide files'; }
   else { el.style.display = 'none'; btn.textContent = 'Show files'; }
+}
+
+async function copyDiff(num) {
+  var btn = document.getElementById('btn-diff-' + num);
+  btn.disabled = true;
+  btn.textContent = 'Fetching...';
+  try {
+    var res = await fetch('/api/copy-diff/' + num);
+    if (!res.ok) throw new Error('Failed to fetch diff');
+    var diff = await res.text();
+    await navigator.clipboard.writeText(diff);
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(function() { btn.textContent = 'Copy Diff'; btn.classList.remove('copied'); btn.disabled = false; }, 2000);
+  } catch(e) {
+    btn.textContent = 'Failed';
+    btn.disabled = false;
+    setTimeout(function() { btn.textContent = 'Copy Diff'; }, 2000);
+  }
 }
 
 async function reviewPR(num) {
@@ -1072,6 +1154,24 @@ var server = http.createServer(async function(req, res) {
       saveFileCache(prNum, files);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(files));
+    } else if (req.method === "GET" && req.url.startsWith("/api/diff/")) {
+      var prNum = parseInt(req.url.split("/").pop());
+      if (isNaN(prNum)) { res.writeHead(400); res.end("Invalid PR number"); return; }
+      var rawDiff = await gh("/pulls/" + prNum, "application/vnd.github.v3.diff");
+      var diff = filterDiff(rawDiff);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(diff);
+    } else if (req.method === "GET" && req.url.startsWith("/api/copy-diff/")) {
+      var prNum = parseInt(req.url.split("/").pop());
+      if (isNaN(prNum)) { res.writeHead(400); res.end("Invalid PR number"); return; }
+      var rawDiff = await gh("/pulls/" + prNum, "application/vnd.github.v3.diff");
+      var sections = rawDiff.split(/(?=^diff --git )/m);
+      var filtered = sections.filter(function(s) {
+        var m = s.match(/^diff --git a\/(.+?) b\//);
+        return !m || !skipFile(m[1]);
+      });
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(filtered.join(""));
     } else if (req.method === "GET" && req.url.startsWith("/api/cached-review/")) {
       var prNum = parseInt(req.url.split("/").pop());
       if (isNaN(prNum)) { res.writeHead(400); res.end("Invalid PR number"); return; }

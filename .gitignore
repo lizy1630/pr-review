@@ -3,3 +3,4 @@ node_modules/
 reviews/
 file-cache.json
 flagged.json
+.claude/settings.local.json
