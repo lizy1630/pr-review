@@ -71,6 +71,42 @@ async function getJiraPriorityTickets() {
   });
 }
 
+// Jira: get tickets in the current active sprint
+async function getSprintTickets() {
+  if (!JIRA_EMAIL || !JIRA_API_TOKEN) return [];
+  var auth = Buffer.from(JIRA_EMAIL + ":" + JIRA_API_TOKEN).toString("base64");
+  var headers = { Authorization: "Basic " + auth, Accept: "application/json" };
+
+  // Find all agile boards for this project
+  var boardRes = await fetch(JIRA_BASE_URL + "/rest/agile/1.0/board?type=scrum&maxResults=50", { headers: headers });
+  if (!boardRes.ok) { console.error("Jira board API " + boardRes.status); return []; }
+  var boards = await boardRes.json();
+  if (!boards.values || !boards.values.length) return [];
+
+  // Collect tickets from all active sprints across all boards
+  var allTickets = [];
+  var seen = {};
+  for (var b = 0; b < boards.values.length; b++) {
+    var boardId = boards.values[b].id;
+    var sprintRes = await fetch(JIRA_BASE_URL + "/rest/agile/1.0/board/" + boardId + "/sprint?state=active&maxResults=1", { headers: headers });
+    if (!sprintRes.ok) continue;
+    var sprints = await sprintRes.json();
+    if (!sprints.values || !sprints.values.length) continue;
+
+    var sprintId = sprints.values[0].id;
+    var issueRes = await fetch(JIRA_BASE_URL + "/rest/agile/1.0/sprint/" + sprintId + "/issue?maxResults=100&fields=key,summary,status", { headers: headers });
+    if (!issueRes.ok) continue;
+    var issueData = await issueRes.json();
+    (issueData.issues || []).forEach(function(i) {
+      if (!seen[i.key]) {
+        seen[i.key] = true;
+        allTickets.push({ key: i.key, summary: i.fields.summary, status: i.fields.status.name });
+      }
+    });
+  }
+  return allTickets;
+}
+
 async function doTransition(ticketKey, transitionId, headers) {
   var r = await fetch(JIRA_BASE_URL + "/rest/api/3/issue/" + ticketKey + "/transitions", {
     method: "POST", headers: headers,
@@ -557,6 +593,8 @@ function getHTML() {
   .btn-staging.done { border-color: #4ade80; color: #4ade80; }
   .merged-card .btn-cherry { display: inline-block; }
 
+  .pr-card.sprint-active { border-color: #c084fc; background: rgba(192,132,252,.08); }
+  .sprint-badge { font-size: 10px; padding: 2px 8px; border-radius: 99px; font-weight: 600; background: rgba(192,132,252,.15); color: #c084fc; margin-left: 6px; }
   .error-msg { color: #f87171; font-size: 12px; padding: 8px 0; }
   .no-prs { text-align: center; padding: 60px; color: #475569; }
   .pr-card.reviewed { border-color: #22c55e; background: rgba(34,197,94,.08); }
@@ -594,7 +632,7 @@ var allPRs = [];
 var currentSort = 'date';
 var prFileCount = {}; // num -> file count, populated by loadFiles
 
-document.addEventListener('DOMContentLoaded', function() { loadPRs().then(function() { loadFlagged(); loadJiraPriority(); }); loadMergedPRs(); setInterval(loadFlagged, 30000); });
+document.addEventListener('DOMContentLoaded', function() { loadPRs().then(function() { loadFlagged(); loadJiraPriority(); loadSprintTickets(); }); loadMergedPRs(); setInterval(loadFlagged, 30000); });
 
 async function loadPRs() {
   try {
@@ -672,6 +710,32 @@ async function loadJiraPriority() {
   } catch(e) { /* ignore */ }
 }
 
+async function loadSprintTickets() {
+  try {
+    var res = await fetch('/api/jira-sprint');
+    if (!res.ok) return;
+    var tickets = await res.json();
+    var sprintKeys = {};
+    tickets.forEach(function(t) { sprintKeys[t.key] = t; });
+
+    document.querySelectorAll('.pr-card').forEach(function(card) {
+      var badges = card.querySelectorAll('.jira-badge');
+      badges.forEach(function(badge) {
+        var ticketKey = badge.textContent.trim();
+        if (sprintKeys[ticketKey]) {
+          if (!card.classList.contains('sprint-active')) {
+            card.classList.add('sprint-active');
+          }
+          var titleRow = card.querySelector('.pr-title-row');
+          if (titleRow && !card.querySelector('.sprint-badge')) {
+            titleRow.insertAdjacentHTML('beforeend', '<span class="sprint-badge">SPRINT</span>');
+          }
+        }
+      });
+    });
+  } catch(e) { /* ignore */ }
+}
+
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 var JIRA_BASE = 'https://inspirehub.atlassian.net/browse/';
@@ -685,10 +749,20 @@ async function sha256(str) {
 }
 
 function extractJiraTickets(pr) {
-  var text = (pr.title || '') + ' ' + (pr.branch || '') + ' ' + (pr.body || '');
+  var body = pr.body || '';
+  // Look for a "Jira" section header in the PR description
+  var jiraSection = body.match(/##?\s*Jira\b[^\n]*\n([\s\S]*?)(?=\n##?\s|\n---|\s*$)/i);
+  if (jiraSection) {
+    var sectionMatches = jiraSection[1].match(/[A-Z][A-Z0-9]+-\d+/g);
+    if (sectionMatches && sectionMatches.length) {
+      var seen = {};
+      return sectionMatches.filter(function(t) { if (seen[t]) return false; seen[t] = true; return true; });
+    }
+  }
+  // Fallback: search title + branch + full body
+  var text = (pr.title || '') + ' ' + (pr.branch || '') + ' ' + body;
   var matches = text.match(/[A-Z][A-Z0-9]+-\\d+/g);
   if (!matches) return [];
-  // deduplicate
   var seen = {};
   return matches.filter(function(t) { if (seen[t]) return false; seen[t] = true; return true; });
 }
@@ -727,8 +801,10 @@ function sortPRs(by) {
     cards.sort(function(a, b) { return dir * (new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at)); });
   } else if (by === 'tagged') {
     cards.sort(function(a, b) {
-      var aTagged = flaggedPRs[a.number] || document.getElementById('pr-' + a.number).classList.contains('jira-priority') ? 1 : 0;
-      var bTagged = flaggedPRs[b.number] || document.getElementById('pr-' + b.number).classList.contains('jira-priority') ? 1 : 0;
+      var aEl = document.getElementById('pr-' + a.number);
+      var bEl = document.getElementById('pr-' + b.number);
+      var aTagged = (aEl && (aEl.classList.contains('flagged') || aEl.classList.contains('jira-priority') || aEl.classList.contains('sprint-active') || aEl.classList.contains('reviewed'))) ? 1 : 0;
+      var bTagged = (bEl && (bEl.classList.contains('flagged') || bEl.classList.contains('jira-priority') || bEl.classList.contains('sprint-active') || bEl.classList.contains('reviewed'))) ? 1 : 0;
       if (aTagged !== bTagged) return dir * (bTagged - aTagged);
       return dir * (new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
     });
@@ -1210,6 +1286,10 @@ var server = http.createServer(async function(req, res) {
     } else if (req.method === "GET" && req.url === "/api/flagged") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(getFlagged()));
+    } else if (req.method === "GET" && req.url === "/api/jira-sprint") {
+      var sprintTickets = await getSprintTickets();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(sprintTickets));
     } else if (req.method === "GET" && req.url === "/api/jira-priority") {
       var tickets = await getJiraPriorityTickets();
       res.writeHead(200, { "Content-Type": "application/json" });
