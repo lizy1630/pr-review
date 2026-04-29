@@ -546,9 +546,11 @@ function getHTML() {
   .issue-file:hover { text-decoration: underline; color: #a5b4fc; }
   .issue-title { font-size: 13px; font-weight: 600; margin-bottom: 3px; }
   .issue-desc { font-size: 12px; color: #94a3b8; line-height: 1.5; }
-  .issue-fix { margin-top: 8px; padding: 8px; background: #08080d; border: 1px solid #1e1e2e; border-radius: 6px; }
-  .issue-fix-label { font-size: 10px; color: #64748b; font-weight: 600; margin-bottom: 3px; }
-  .issue-fix pre { font-size: 12px; color: #86efac; white-space: pre-wrap; margin: 0; }
+  .issue-fix { margin-top: 8px; padding: 10px 12px; background: #0c0c14; border: 1px solid #1e1e2e; border-radius: 6px; }
+  .issue-fix-label { font-size: 10px; color: #64748b; font-weight: 600; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .issue-fix .fix-text { font-size: 12px; color: #cbd5e1; line-height: 1.6; }
+  .issue-fix .fix-text code { font-family: 'Consolas','Monaco','Courier New',monospace; font-size: 11.5px; background: rgba(134,239,172,.1); color: #86efac; padding: 1px 5px; border-radius: 3px; border: 1px solid rgba(134,239,172,.15); }
+  .issue-fix pre.fix-code { font-family: 'Consolas','Monaco','Courier New',monospace; font-size: 12px; color: #86efac; background: #06060a; border: 1px solid #1a1a2e; border-radius: 4px; padding: 10px 12px; margin: 6px 0; white-space: pre-wrap; word-break: break-word; line-height: 1.5; overflow-x: auto; }
 
   .pr-checks { display: flex; gap: 12px; align-items: center; padding: 0 20px 10px; }
   .pr-check { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #64748b; cursor: pointer; user-select: none; }
@@ -738,6 +740,26 @@ async function loadSprintTickets() {
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+function renderSuggestion(raw) {
+  var s = raw || '';
+  // Split on fenced code blocks first
+  var parts = s.split(/(\\x60\\x60\\x60[\\s\\S]*?\\x60\\x60\\x60)/g);
+  var out = '';
+  for (var i = 0; i < parts.length; i++) {
+    var part = parts[i];
+    var fenced = part.match(/^\\x60\\x60\\x60(?:\\w*)\\n?([\\s\\S]*?)\\x60\\x60\\x60$/);
+    if (fenced) {
+      out += '<pre class="fix-code">' + esc(fenced[1].replace(/^\\n|\\n$/g, '')) + '</pre>';
+    } else {
+      // Inline code
+      var escaped = esc(part);
+      escaped = escaped.replace(/\\x60([^\\x60]+?)\\x60/g, '<code>$1</code>');
+      out += '<span class="fix-text">' + escaped + '</span>';
+    }
+  }
+  return out;
+}
+
 var JIRA_BASE = 'https://inspirehub.atlassian.net/browse/';
 var GITHUB_PR = 'https://github.com/' + REPO + '/pull/';
 var prMeta = {}; // num -> { branch, html_url }
@@ -751,12 +773,11 @@ async function sha256(str) {
 function extractJiraTickets(pr) {
   var body = pr.body || '';
   // Look for a "Jira" section header in the PR description
-  var jiraSection = body.match(/##?\s*Jira\b[^\n]*\n([\s\S]*?)(?=\n##?\s|\n---|\s*$)/i);
+  var jiraSection = body.match(/##?\\s*Jira\\b[^\\n]*\\n([\\s\\S]*?)(?=\\n##?\\s|\\n---|\\s*$)/i);
   if (jiraSection) {
-    var sectionMatches = jiraSection[1].match(/[A-Z][A-Z0-9]+-\d+/g);
-    if (sectionMatches && sectionMatches.length) {
-      var seen = {};
-      return sectionMatches.filter(function(t) { if (seen[t]) return false; seen[t] = true; return true; });
+    var sectionMatch = jiraSection[1].match(/[A-Z][A-Z0-9]+-\\d+/);
+    if (sectionMatch) {
+      return [sectionMatch[0]];
     }
   }
   // Fallback: search title + branch + full body
@@ -1130,7 +1151,7 @@ async function renderReview(num, data) {
         + '</div>'
         + '<div class="issue-title">' + esc(issue.title || '') + '</div>'
         + '<div class="issue-desc">' + esc(issue.description || '') + '</div>'
-        + (issue.suggestion ? '<div class="issue-fix"><div class="issue-fix-label">Suggested Fix</div><pre>' + esc(issue.suggestion) + '</pre></div>' : '')
+        + (issue.suggestion ? '<div class="issue-fix"><div class="issue-fix-label">Suggested Fix</div>' + renderSuggestion(issue.suggestion) + '</div>' : '')
         + '</div>';
     }
   }
